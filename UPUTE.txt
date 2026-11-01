@@ -1,0 +1,16 @@
+GLOBAL ECONOMIC RISK MONITOR - JEDNOSTAVAN PRIJENOS
+
+U ZIP-u su samo 3 datoteke, bez podmapa.
+
+1. Na GitHubu otvorite svoj JAVNI repozitorij (Public).
+2. Kliknite Add file > Upload files. Prenesite SAMO update_monitor.py i UPUTE.txt, zatim Commit changes.
+3. Kliknite Add file > Create new file.
+4. U polje naziva upisite tocno: .github/workflows/update.yml
+   GitHub automatski stvara potrebne mape - ne morate ih izradivati rucno.
+5. Otvorite lokalnu datoteku update.yml u Notepadu, kopirajte SAV tekst i zalijepite ga u editor na GitHubu. Kliknite Commit changes.
+6. Otvorite Settings > Pages > Build and deployment > Source: GitHub Actions.
+7. Otvorite Actions > Update global economic dashboard > Run workflow.
+8. Pricekajte da postupak zavrsi zelenom oznakom. Web adresa bit ce:
+   https://KORISNICKO-IME.github.io/NAZIV-REPOZITORIJA/
+
+Napomene: javni repozitorij i GitHub Pages mogu biti besplatni unutar ogranicenja usluge. Podaci dolaze iz javnih FRED CSV serija bez API kljuca. Pojedine serije mogu kasniti ili privremeno biti nedostupne. Raspored pokretanja GitHub Actions nije zajamcen u tocnu minutu.
