@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Public economic dashboard. Standard library only; compatible with existing GitHub workflow."""
-import csv, io, json, sys, time, urllib.request, html, random
+import csv, io, json, sys, time, urllib.request, urllib.parse, html, random, os, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,54 +8,78 @@ ROOT=Path(__file__).resolve().parent
 # id, display name, section, unit, cadence, risk direction (up/down/none)
 SERIES=[('DGS10', 'US 10-year Treasury yield', 'Capital Markets', '%', 'daily', 'up', 'Benchmark long-term borrowing cost for the US government; rising yields can increase refinancing costs.'), ('DFII10', 'US 10-year real yield (TIPS)', 'Capital Markets', '%', 'daily', 'up', 'Inflation-adjusted US Treasury yield; a measure of real financing conditions.'), ('T10Y2Y', 'US yield curve (10Y minus 2Y)', 'Capital Markets', 'pp', 'daily', 'down', 'Difference between 10-year and 2-year Treasury yields; inversion has historically preceded some recessions.'), ('BAMLH0A0HYM2', 'US high-yield credit spread', 'Capital Markets', 'pp', 'daily', 'up', 'Extra yield demanded for riskier corporate bonds relative to Treasuries; a gauge of credit stress.'), ('STLFSI4', 'St. Louis Financial Stress Index', 'Capital Markets', 'index', 'weekly', 'up', 'Composite measure of stress across US financial markets; higher values indicate more stress.'), ('VIXCLS', 'VIX equity volatility index', 'Capital Markets', 'index', 'daily', 'up', 'Options-implied near-term volatility for the S&P 500; not a direct recession probability.'), ('SP500', 'S&P 500 index', 'Capital Markets', 'index', 'daily', 'none', 'Broad index of large US listed companies; market prices may diverge from economic fundamentals.'), ('DTWEXBGS', 'Broad trade-weighted US dollar', 'Monetary System', 'index', 'daily', 'none', 'US dollar exchange value against a broad basket of trading-partner currencies.'), ('M2SL', 'US M2 money stock', 'Monetary System', 'USD bn', 'monthly', 'none', 'Cash and liquid deposits held by the public; not equivalent to physical money printing.'), ('WALCL', 'Federal Reserve total assets', 'Monetary System', 'USD mn', 'weekly', 'none', 'Size of the Federal Reserve balance sheet, including securities and lending assets.'), ('DEXUSEU', 'US dollars per euro', 'Monetary System', 'USD/EUR', 'daily', 'none', 'Exchange rate: US dollars required to buy one euro; a higher value means a stronger euro.'), ('DEXCHUS', 'Chinese yuan per US dollar', 'Monetary System', 'CNY/USD', 'daily', 'none', 'Exchange rate: Chinese yuan required to buy one US dollar.'), ('DEXJPUS', 'Japanese yen per US dollar', 'Monetary System', 'JPY/USD', 'daily', 'none', 'Exchange rate: Japanese yen required to buy one US dollar.'), ('GFDEBTN', 'US gross federal debt', 'Public Debt', 'USD mn', 'quarterly', 'none', 'Total federal debt outstanding, including debt held by the public and intragovernmental holdings.'), ('GFDEGDQ188S', 'US gross federal debt to GDP', 'Public Debt', '%', 'quarterly', 'up', 'Gross federal debt as a share of US GDP; differs from debt held by the public.'), ('A091RC1Q027SBEA', 'US federal interest payments (annual rate)', 'Public Debt', 'USD bn', 'quarterly', 'up', 'Federal interest payments at a seasonally adjusted annual rate; not the same as net budget interest.'), ('CPIAUCSL', 'US consumer price index', 'Global Economy', 'index', 'monthly', 'none', 'Price level for a broad US consumer basket; year-over-year changes measure inflation.'), ('UNRATE', 'US unemployment rate', 'Global Economy', '%', 'monthly', 'up', 'Share of the US labor force unemployed and actively seeking work.'), ('INDPRO', 'US industrial production', 'Global Economy', 'index', 'monthly', 'down', 'Real output of US manufacturing, mining and utilities.'), ('PAYEMS', 'US nonfarm payroll employment', 'Global Economy', 'thousands', 'monthly', 'down', 'Number of US payroll jobs outside farming; revisions can be substantial.'), ('GDPC1', 'US real GDP', 'Global Economy', 'bn chained USD', 'quarterly', 'down', 'Inflation-adjusted output of the US economy, measured quarterly.'), ('IRLTLT01EZM156N', 'Euro area long-term government bond yield', 'Global Economy', '%', 'monthly', 'none', 'Harmonized long-term government bond yield indicator for the euro area (OECD via FRED).'), ('IRLTLT01DEM156N', 'Germany long-term government bond yield', 'Global Economy', '%', 'monthly', 'none', 'Long-term German government bond yield, a benchmark for euro-area borrowing conditions.'), ('JPNCPIALLMINMEI', 'Japan consumer price index', 'Global Economy', 'index', 'monthly', 'none', 'Japan consumer price level; compare annual percentage changes to track inflation.'), ('CHNCPIALLMINMEI', 'China consumer price index', 'Global Economy', 'index', 'monthly', 'none', 'China consumer price level, subject to source updates and reporting lags.'), ('DCOILBRENTEU', 'Brent crude oil price', 'Energy & Commodities', 'USD/bbl', 'daily', 'none', 'International crude oil benchmark, sensitive to supply, demand and geopolitical disruption.'), ('DCOILWTICO', 'WTI crude oil price', 'Energy & Commodities', 'USD/bbl', 'daily', 'none', 'US crude oil benchmark; its difference from Brent reflects regional market conditions.'), ('DHHNGSP', 'Henry Hub natural gas price', 'Energy & Commodities', 'USD/MMBtu', 'daily', 'none', 'US natural gas spot benchmark; not the same as European gas prices.'), ('IPMAN', 'US manufacturing production', 'Industry & Trade', 'index', 'monthly', 'down', 'Inflation-adjusted US manufacturing output, excluding mining and utilities.'), ('IPG3344S', 'US semiconductor manufacturing output', 'Industry & Trade', 'index', 'monthly', 'down', 'US semiconductor and electronic component manufacturing production proxy; not global chip sales.'), ('HOUST', 'US housing starts', 'Industry & Trade', 'thousands SAAR', 'monthly', 'down', 'New US residential construction starts at a seasonally adjusted annual rate.'), ('PERMIT', 'US building permits', 'Industry & Trade', 'thousands SAAR', 'monthly', 'down', 'US residential building permits, a forward-looking indicator for construction.'), ('IPG3361T3S', 'US motor vehicle and parts production', 'Industry & Trade', 'index', 'monthly', 'down', 'US motor vehicle and parts industrial production; not worldwide vehicle sales.')]
 HEADERS={'User-Agent':'Mozilla/5.0 GlobalEconomicRiskMonitor/4.2'}
+def request_json(url, timeout=25):
+    req=urllib.request.Request(url,headers=HEADERS)
+    with urllib.request.urlopen(req,timeout=timeout) as response:
+        return json.load(response)
+
+def parse_dbnomics(payload):
+    docs=payload.get('series',{}).get('docs',[])
+    if not docs:raise ValueError('DBnomics returned no series')
+    doc=docs[0]
+    points=[]
+    for period,value in zip(doc.get('period',[]),doc.get('value',[])):
+        try:
+            v=float(value)
+            if not (-float('inf')<v<float('inf')):continue
+            ds=str(period)
+            if len(ds)==4:ds+='-01-01'
+            elif len(ds)==7:ds+='-01'
+            points.append([ds,v])
+        except (ValueError,TypeError):pass
+    points.sort(key=lambda row:row[0])
+    if not points:raise ValueError('DBnomics returned no numeric observations')
+    return points
+
 def fetch(code):
-    """Try FRED first, then DBnomics' public FRED mirror (no API key)."""
-    errors=[]
-    url='https://fred.stlouisfed.org/graph/fredgraph.csv?id='+code
+    """Fetch one real series; never substitute a different economic indicator.
+
+    FRED official observations API is preferred when FRED_API_KEY is configured.
+    The public FRED graph CSV works without a key but may be rate-limited.
+    DBnomics uses a three-part provider/dataset/series path. DBnomics may
+    not host every FRED series; 404 is treated as unavailable, not as data.
+    """
+    problems=[]
+    api_key=os.environ.get('FRED_API_KEY','').strip()
+    if api_key:
+        url=('https://api.stlouisfed.org/fred/series/observations?series_id='
+             +urllib.parse.quote(code)+'&file_type=json&api_key='+urllib.parse.quote(api_key))
+        try:
+            data=request_json(url,timeout=30)
+            points=[]
+            for obs in data.get('observations',[]):
+                try:points.append([obs['date'],float(obs['value'])])
+                except (ValueError,TypeError,KeyError):pass
+            if points:return points,'https://fred.stlouisfed.org/series/'+code
+            raise ValueError('No numeric FRED API observations')
+        except Exception as exc:
+            problems.append('FRED official API: '+str(exc).replace(api_key,'[REDACTED]')[:150])
+    url='https://fred.stlouisfed.org/graph/fredgraph.csv?id='+urllib.parse.quote(code)
     for attempt in range(2):
         try:
             req=urllib.request.Request(url,headers=HEADERS)
-            with urllib.request.urlopen(req,timeout=12) as res:
-                raw=res.read().decode('utf-8-sig')
-            rows=csv.reader(io.StringIO(raw));next(rows,None);points=[]
-            for row in rows:
-                if len(row)<2 or row[1].strip() in ('','.','NaN'):continue
+            with urllib.request.urlopen(req,timeout=28) as response:
+                raw=response.read().decode('utf-8-sig')
+            reader=csv.reader(io.StringIO(raw));next(reader,None)
+            points=[]
+            for row in reader:
+                if len(row)<2:continue
                 try:points.append([row[0],float(row[1])])
-                except ValueError:pass
-            if not points:raise ValueError('No numeric FRED observations')
+                except (ValueError,TypeError):pass
+            if not points:raise ValueError('FRED CSV contained no numeric observations')
             return points,url
         except Exception as exc:
-            errors.append('FRED: '+str(exc))
-            if attempt==0:time.sleep(1.0+random.random())
-    mirror='https://api.db.nomics.world/v22/series/FRED/'+code+'?observations=1'
-    for attempt in range(2):
-        try:
-            req=urllib.request.Request(mirror,headers=HEADERS)
-            with urllib.request.urlopen(req,timeout=18) as res:
-                payload=json.load(res)
-            docs=payload['series']['docs']
-            if not docs:raise ValueError('Series not found in mirror')
-            doc=docs[0]
-            periods=doc.get('period',[])
-            values=doc.get('value',[])
-            points=[]
-            for period,value in zip(periods,values):
-                try:
-                    if value is None or isinstance(value,bool):continue
-                    val=float(value)
-                    if not (-float('inf')<val<float('inf')):continue
-                    ds=str(period)
-                    if len(ds)==4:ds+='-01-01'
-                    elif len(ds)==7:ds+='-01'
-                    points.append([ds,val])
-                except (ValueError,TypeError):continue
-            points.sort(key=lambda x:x[0])
-            if not points:raise ValueError('No numeric observations in mirror')
-            return points,mirror
-        except Exception as exc:
-            errors.append('DBnomics: '+str(exc))
-            if attempt==0:time.sleep(2+random.random())
-    raise RuntimeError('Both sources unavailable: '+'; '.join(errors[-2:]))
+            problems.append('FRED CSV: '+str(exc)[:150])
+            if attempt==0:time.sleep(1.5+random.random())
+    # The former two-part URL was invalid: DBnomics requires
+    # /series/{provider}/{dataset}/{series}. FRED series may not be mirrored.
+    mirror='https://api.db.nomics.world/v22/series/FRED/'+urllib.parse.quote(code)+'/'+urllib.parse.quote(code)+'?observations=1'
+    try:
+        points=parse_dbnomics(request_json(mirror,timeout=22))
+        return points,mirror
+    except Exception as exc:
+        problems.append('DBnomics: '+str(exc)[:150])
+    raise RuntimeError(' | '.join(problems[-3:]))
 
 # Read last successfully published observations from the live Pages site.
 # If the source is unavailable, the previous published website remains intact.
@@ -64,18 +88,33 @@ def load_previous():
     local=ROOT/'data'/'latest.json'
     if local.exists():
         try:candidates.append(json.loads(local.read_text(encoding='utf-8')))
-        except Exception:pass
-    url='https://ikmezic.github.io/global-economic-monitor/data/latest.json'
-    try:
-        req=urllib.request.Request(url,headers=HEADERS)
-        with urllib.request.urlopen(req,timeout=12) as res:
-            candidates.insert(0,json.load(res))
-    except Exception as exc:
-        print('Previous published snapshot not reachable:',exc,flush=True)
+        except Exception as exc:print('Local cache invalid:',exc,flush=True)
+    base='https://ikmezic.github.io/global-economic-monitor/'
+    for path in ('data/latest.json','dashboard.html','index.html',''):
+        try:
+            req=urllib.request.Request(base+path,headers=HEADERS)
+            with urllib.request.urlopen(req,timeout=15) as response:
+                raw=response.read().decode('utf-8-sig')
+            if path.endswith('.json'):
+                payload=json.loads(raw)
+            else:
+                match=re.search(r'<script\s+id=["\']payload["\']\s+type=["\']application/json["\']\s*>(.*?)</script>',raw,re.S|re.I)
+                if not match:continue
+                payload=json.loads(match.group(1))
+            if isinstance(payload,dict) and isinstance(payload.get('series'),list):
+                candidates.append(payload)
+                print('PREVIOUS SNAPSHOT',path or '(site root)',len(payload['series']),'series',flush=True)
+                break
+        except Exception as exc:
+            print('Previous snapshot',path or '(site root)','not accessible:',str(exc)[:120],flush=True)
+    # Merge rather than discard local history if public snapshot is incomplete.
+    merged={}
     for payload in candidates:
-        if isinstance(payload,dict) and isinstance(payload.get('series'),list):
-            return {s['id']:s for s in payload['series'] if isinstance(s,dict) and s.get('id') and s.get('points')}
-    return {}
+        for s in payload.get('series',[]):
+            if isinstance(s,dict) and s.get('id') and s.get('points'):
+                if s['id'] not in merged or len(s['points'])>len(merged[s['id']]['points']):
+                    merged[s['id']]=s
+    return merged
 
 
 # World Bank Open Data API: international country and world aggregates.
@@ -143,6 +182,8 @@ def main():
         code,name,section,unit,freq,direction,description=entry
         try:return entry,fetch(code),None
         except Exception as ex:return entry,None,str(ex)
+    # Diagnostic probes use three representative series from the normal download.
+    print("SOURCE DIAGNOSTICS: checking Treasury yield DGS10, Brent DCOILBRENTEU and unemployment UNRATE",flush=True)
     # A modest worker pool prevents one slow series from blocking all others.
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures=[pool.submit(load_fred,e) for e in SERIES]
@@ -155,11 +196,11 @@ def main():
             recent=points[-1];prior=points[-2][1] if len(points)>1 else None
             s={'id':code,'name':name,'category':section,'unit':unit,'frequency':freq,'direction':direction,'description':description,'date':recent[0],'value':recent[1],'previous':prior,'source':url,'points':points,'country':'United States' if name.startswith('US ') or name.startswith('Federal Reserve') or name.startswith('St. Louis') or name.startswith('S&P') or name.startswith('VIX') else ('Germany' if name.startswith('Germany') else 'Japan' if name.startswith('Japan') else 'China' if name.startswith('China') else 'European Union' if name.startswith('Euro area') else 'Cross-market / US-linked'),'provider':'FRED','data_status':'fresh'}
             fresh_fred+=1
-            print('OK',code,recent,flush=True)
+            print('OK',code,recent,'SOURCE',url,flush=True)
         elif code in previous:
             s=dict(previous[code]);s['data_status']='cached';s['fetch_error']=error
             cached_fred+=1
-            print('CACHED',code,error,flush=True)
+            print('CACHED',code,'last observation',s.get('date'),'SOURCE ERROR',error,flush=True)
         else:
             errors.append(code+': '+error)
             print('UNAVAILABLE',code,error,file=sys.stderr,flush=True)
@@ -177,11 +218,12 @@ def main():
             cached=dict(s);cached['data_status']='cached';cached_wb+=1
             snapshot.append(cached)
             all_rows.extend((cached['id'],cached['name'],cached['category'],cached['unit'],d,v,cached['source']) for d,v in cached['points'])
+    print('SOURCE DIAGNOSTICS RESULT:', ', '.join(f'{code}={"OK" if any(s["id"]==code and s.get("data_status")=="fresh" for s in snapshot) else "CACHED" if code in previous else "UNAVAILABLE"}' for code in ('DGS10','DCOILBRENTEU','UNRATE')),flush=True)
     # Do not overwrite a healthy published site with an outage snapshot.
     if fresh_fred==0 and fresh_wb==0:
         raise SystemExit('DATA OUTAGE: No sources updated. Publication aborted; existing site remains online.')
     if fresh_fred+cached_fred<max(5,len(SERIES)//4):
-        raise SystemExit('DATA OUTAGE: Too few FRED series available or cached. Publication aborted to protect the dashboard.')
+        raise SystemExit('DATA OUTAGE: Too few FRED series available or cached. Publication aborted to protect the dashboard. Optional: add FRED_API_KEY as a GitHub Actions secret and pass it to the workflow environment.')
     if not snapshot:raise SystemExit('No valid data; publication aborted')
     print(f'RELIABILITY fresh FRED={fresh_fred}, cached FRED={cached_fred}, fresh World Bank={fresh_wb}, cached World Bank={cached_wb}, unavailable={len(errors)}',flush=True)
     stamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -203,7 +245,7 @@ def main():
 TEMPLATE=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Global Economic Risk Monitor</title>
 <style>
 :root{color-scheme:dark;--bg:#091322;--panel:#111f32;--line:#27384c;--text:#e9f0fa;--muted:#9eb0c7;--accent:#70b9ff;--green:#53d3a0;--amber:#f5c56a;--red:#f07f88}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Segoe UI,sans-serif}header{padding:27px max(18px,5vw);border-bottom:1px solid var(--line);background:#0d1b2e}h1{margin:0;font-size:clamp(25px,3vw,38px)}header p,.sub,.hint{color:var(--muted)}.wrap{max-width:1450px;margin:auto;padding:24px 18px}.top{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px}.pill{background:var(--panel);border:1px solid var(--line);padding:10px 15px;border-radius:12px}.nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}button,select{font:inherit;color:var(--text);background:#192b41;border:1px solid #38506b;border-radius:9px;padding:9px 12px;cursor:pointer}button.active{background:#23548a;border-color:var(--accent)}.filters{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 16px}.filters .hint{font-size:12px}.risk-summary{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:15px}.risk-pill{background:#192b41;border:1px solid #38506b;border-radius:9px;padding:10px 13px;font-size:12px}.risk-pill strong{display:block;margin-top:4px;font-size:15px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:17px;cursor:pointer}.card:hover{border-color:var(--accent)}.card h3{margin:8px 0 10px;font-size:16px}.explain{font-size:12px;line-height:1.55;color:var(--muted);margin:10px 0 0}.meta{color:var(--muted);font-size:12px}.value{font-size:clamp(17px,1.6vw,24px);font-weight:750;line-height:1.2;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.card{min-width:0}.card .value{max-width:100%}.unit{font-size:12px;color:var(--muted)}.flag{display:inline-block;font-size:11px;padding:4px 8px;border-radius:8px;background:#23364a}.flag.warn{background:#574422;color:#ffda8c}.flag.high{background:#5c2732;color:#ffb0b8}.flag.ok{background:#1d493c;color:#92ebc5}.chartbox{margin-top:23px;background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:19px}canvas{width:100%;height:360px;display:block;cursor:crosshair}.chart-controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}.chart-controls label{color:var(--muted);font-size:13px}.chart-controls input{accent-color:var(--accent)}.charthead{display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between}.charthead h2{margin:0}.periods{display:flex;gap:5px;flex-wrap:wrap}.periods button{font-size:12px;padding:7px 10px}.footer{margin:24px 0;color:var(--muted);font-size:12px}.alert{border-left:4px solid var(--amber);padding:12px 15px;background:#28283a;border-radius:8px;margin-bottom:14px}.bad{border-left-color:var(--red)}a{color:#91c9ff}.hide{display:none}@media(max-width:600px){canvas{height:240px}.value{font-size:23px}}
-</style></head><body><header><h1>Global Economic &amp; Financial Risk Monitor</h1><p>World and major economies · trusted public sources · historical trends · dated chart axes</p></header><main class="wrap"><div id="summary" class="top"></div><div class="nav" id="nav"></div><div class="filters"><label for="country">Economy: </label><select id="country"></select><span class="hint">Geography: World Bank regional aggregates and countries. Income groups overlap with geographic groups. Annual observations may lag.</span></div><div class="hint" style="margin-bottom:15px">Geographic grouping follows World Bank regions; income groups are a separate classification. IMF advanced/emerging economies are not interchangeable with World Bank income groups. US indicators are labelled United States, not Other economies. World Bank region totals and country observations should not be added together.</div><div id="riskSummary" class="risk-summary"></div><div id="alerts"></div><div id="cards" class="grid"></div><section class="chartbox"><div class="charthead"><div><h2 id="chartTitle">Historical trend</h2><div id="chartMeta" class="meta"></div></div><div class="periods" id="periods"></div></div><div class="chart-controls"><label><input type="checkbox" id="events"> Show major historical events</label><span class="hint">Hover over the chart for exact date and value</span></div><canvas id="plot" aria-label="Historical data chart with calendar-year horizontal axis"></canvas><p id="stats" class="hint"></p><p id="chartDescription" class="explain"></p><p class="meta">Forecasts are not generated in this version. For forward-looking analysis, use IMF WEO published projections as an independently labelled forecast source, then validate any in-house models with historical backtests. </p><p class="meta">Select a metric card to view its history. Percentile flags describe historical extremes, not crisis forecasts. Risk warnings use transparent thresholds: GDP growth below 0%, inflation above 8%, unemployment above 10%, or central-government debt above 100% of GDP. These are screening rules, not forecasts or comparable sovereign credit ratings.</p><a id="source" target="_blank" rel="noopener">Open original data source</a></section><div class="footer">Sources: World Bank Open Data API and Federal Reserve Bank of St. Louis (FRED). Observation dates may lag behind the refresh date. Educational use only; not investment advice. No personal data.</div></main>
+</style></head><body><header><h1>Global Economic &amp; Financial Risk Monitor</h1><p>World and major economies · trusted public sources · historical trends · dated chart axes</p></header><main class="wrap"><div id="summary" class="top"></div><div class="nav" id="nav"></div><div class="filters"><label for="country">Economy: </label><select id="country"></select><span class="hint">Geography: World Bank regional aggregates and countries. Income groups overlap with geographic groups. Annual observations may lag.</span></div><div class="hint" style="margin-bottom:15px">Geographic grouping follows World Bank regions; income groups are a separate classification. IMF advanced/emerging economies are not interchangeable with World Bank income groups. US indicators are labelled United States, not Other economies. World Bank region totals and country observations should not be added together.</div><div id="riskSummary" class="risk-summary"></div><div id="alerts"></div><div id="cards" class="grid"></div><section class="chartbox"><div class="charthead"><div><h2 id="chartTitle">Historical trend</h2><div id="chartMeta" class="meta"></div></div><div class="periods" id="periods"></div></div><div class="chart-controls"><label><input type="checkbox" id="events"> Show major historical events</label><span class="hint">Hover over the chart for exact date and value</span></div><canvas id="plot" aria-label="Historical data chart with calendar-year horizontal axis"></canvas><p id="stats" class="hint"></p><p id="chartDescription" class="explain"></p><p class="meta">Forecasts are not generated in this version. For forward-looking analysis, use IMF WEO published projections as an independently labelled forecast source, then validate any in-house models with historical backtests. </p><p class="meta">Select a metric card to view its history. Percentile flags describe historical extremes, not crisis forecasts. Risk warnings use transparent thresholds: GDP growth below 0%, inflation above 8%, unemployment above 10%, or central-government debt above 100% of GDP. These are screening rules, not forecasts or comparable sovereign credit ratings.</p><a id="source" target="_blank" rel="noopener">Open original data source</a></section><div class="footer">Sources: World Bank Open Data API, Federal Reserve Bank of St. Louis (FRED), and DBnomics where available. Observation dates may lag behind the refresh date. Educational use only; not investment advice. No personal data.</div></main>
 <script id="payload" type="application/json">__DATA_JSON__</script><script>
 const D=JSON.parse(document.getElementById('payload').textContent), S=D.series, groups=['All','Global Economy','Monetary System','Public Debt','Energy & Commodities','Industry & Trade','Capital Markets'];let group='All',selected=S[0],years=5,country='All',hoverX=null;
 const $=id=>document.getElementById(id), fmt=(v,d=2)=>Number(v).toLocaleString('en-US',{maximumFractionDigits:d}),compactValue=s=>s.unit==='USD'&&Math.abs(s.value)>=1e9?('$'+fmt(s.value/1e12)+'T'):fmt(s.value),displayUnit=s=>s.unit==='USD'&&Math.abs(s.value)>=1e9?'':s.unit,today=new Date(D.updated.replace(' UTC','Z'));
