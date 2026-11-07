@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Public economic dashboard. Standard library only; compatible with existing GitHub workflow."""
-import csv, io, json, sys, time, urllib.request, html
+import csv, io, json, sys, time, urllib.request, html, random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
@@ -9,15 +10,43 @@ SERIES=[('DGS10', 'US 10-year Treasury yield', 'Capital Markets', '%', 'daily', 
 HEADERS={'User-Agent':'Mozilla/5.0 GlobalEconomicRiskMonitor/4.2'}
 def fetch(code):
     url='https://fred.stlouisfed.org/graph/fredgraph.csv?id='+code
-    req=urllib.request.Request(url,headers=HEADERS)
-    with urllib.request.urlopen(req,timeout=35) as res: raw=res.read().decode('utf-8-sig')
-    rows=list(csv.reader(io.StringIO(raw))); points=[]
-    for row in rows[1:]:
-        if len(row)<2 or row[1].strip() in ('','.','NaN'): continue
-        try: points.append([row[0],float(row[1])])
-        except ValueError: pass
-    if not points: raise ValueError('No numeric observations')
-    return points,url
+    last_error=None
+    for attempt in range(3):
+        try:
+            req=urllib.request.Request(url,headers=HEADERS)
+            with urllib.request.urlopen(req,timeout=16) as res:
+                raw=res.read().decode('utf-8-sig')
+            rows=list(csv.reader(io.StringIO(raw)));points=[]
+            for row in rows[1:]:
+                if len(row)<2 or row[1].strip() in ('','.','NaN'):continue
+                try:points.append([row[0],float(row[1])])
+                except ValueError:pass
+            if not points:raise ValueError('No numeric observations')
+            return points,url
+        except Exception as exc:
+            last_error=exc
+            if attempt<2:time.sleep(1.5*(2**attempt)+random.uniform(0,.7))
+    raise RuntimeError(f'Failed after 3 attempts: {last_error}')
+
+# Read last successfully published observations from the live Pages site.
+# If the source is unavailable, the previous published website remains intact.
+def load_previous():
+    candidates=[]
+    local=ROOT/'data'/'latest.json'
+    if local.exists():
+        try:candidates.append(json.loads(local.read_text(encoding='utf-8')))
+        except Exception:pass
+    url='https://ikmezic.github.io/global-economic-monitor/data/latest.json'
+    try:
+        req=urllib.request.Request(url,headers=HEADERS)
+        with urllib.request.urlopen(req,timeout=12) as res:
+            candidates.insert(0,json.load(res))
+    except Exception as exc:
+        print('Previous published snapshot not reachable:',exc,flush=True)
+    for payload in candidates:
+        if isinstance(payload,dict) and isinstance(payload.get('series'),list):
+            return {s['id']:s for s in payload['series'] if isinstance(s,dict) and s.get('id') and s.get('points')}
+    return {}
 
 
 # World Bank Open Data API: international country and world aggregates.
@@ -79,21 +108,53 @@ def international_series():
 
 def main():
     out=ROOT/'data';out.mkdir(exist_ok=True)
+    previous=load_previous()
     snapshot=[];all_rows=[];errors=[]
-    for code,name,section,unit,freq,direction,description in SERIES:
-        try:
-            points,url=fetch(code)
-            recent=points[-1]; prior=points[-2][1] if len(points)>1 else None
-            snapshot.append({'id':code,'name':name,'category':section,'unit':unit,'frequency':freq,'direction':direction,'description':description,'date':recent[0],'value':recent[1],'previous':prior,'source':url,'points':points,'country':'United States' if name.startswith('US ') or name.startswith('Federal Reserve') or name.startswith('St. Louis') or name.startswith('S&P') or name.startswith('VIX') else ('Germany' if name.startswith('Germany') else 'Japan' if name.startswith('Japan') else 'China' if name.startswith('China') else 'European Union' if name.startswith('Euro area') else 'Cross-market / US-linked'), 'provider':'FRED'})
-            all_rows.extend((code,name,section,unit,d,v,url) for d,v in points)
-            print('OK',code,recent)
-        except Exception as ex:
-            errors.append(code+': '+str(ex));print('ERROR',errors[-1],file=sys.stderr)
-        time.sleep(.12)
-    for s in international_series():
+    def load_fred(entry):
+        code,name,section,unit,freq,direction,description=entry
+        try:return entry,fetch(code),None
+        except Exception as ex:return entry,None,str(ex)
+    # A modest worker pool prevents one slow series from blocking all others.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures=[pool.submit(load_fred,e) for e in SERIES]
+        results=[f.result() for f in futures]
+    fresh_fred=0;cached_fred=0
+    for entry,result,error in results:
+        code,name,section,unit,freq,direction,description=entry
+        if result:
+            points,url=result
+            recent=points[-1];prior=points[-2][1] if len(points)>1 else None
+            s={'id':code,'name':name,'category':section,'unit':unit,'frequency':freq,'direction':direction,'description':description,'date':recent[0],'value':recent[1],'previous':prior,'source':url,'points':points,'country':'United States' if name.startswith('US ') or name.startswith('Federal Reserve') or name.startswith('St. Louis') or name.startswith('S&P') or name.startswith('VIX') else ('Germany' if name.startswith('Germany') else 'Japan' if name.startswith('Japan') else 'China' if name.startswith('China') else 'European Union' if name.startswith('Euro area') else 'Cross-market / US-linked'),'provider':'FRED','data_status':'fresh'}
+            fresh_fred+=1
+            print('OK',code,recent,flush=True)
+        elif code in previous:
+            s=dict(previous[code]);s['data_status']='cached';s['fetch_error']=error
+            cached_fred+=1
+            print('CACHED',code,error,flush=True)
+        else:
+            errors.append(code+': '+error)
+            print('UNAVAILABLE',code,error,file=sys.stderr,flush=True)
+            continue
         snapshot.append(s)
         all_rows.extend((s['id'],s['name'],s['category'],s['unit'],d,v,s['source']) for d,v in s['points'])
-    if not snapshot: raise SystemExit('No valid data; publication aborted')
+    fresh_wb=0;cached_wb=0
+    for s in international_series():
+        s['data_status']='fresh';fresh_wb+=1
+        snapshot.append(s)
+        all_rows.extend((s['id'],s['name'],s['category'],s['unit'],d,v,s['source']) for d,v in s['points'])
+    existing={s['id'] for s in snapshot}
+    for key,s in previous.items():
+        if key.startswith('WB_') and key not in existing:
+            cached=dict(s);cached['data_status']='cached';cached_wb+=1
+            snapshot.append(cached)
+            all_rows.extend((cached['id'],cached['name'],cached['category'],cached['unit'],d,v,cached['source']) for d,v in cached['points'])
+    # Do not overwrite a healthy published site with an outage snapshot.
+    if fresh_fred==0 and fresh_wb==0:
+        raise SystemExit('DATA OUTAGE: No sources updated. Publication aborted; existing site remains online.')
+    if fresh_fred<max(5,len(SERIES)//4) and not previous:
+        raise SystemExit('DATA OUTAGE: Too few FRED series and no backup snapshot. Publication aborted.')
+    if not snapshot:raise SystemExit('No valid data; publication aborted')
+    print(f'RELIABILITY fresh FRED={fresh_fred}, cached FRED={cached_fred}, fresh World Bank={fresh_wb}, cached World Bank={cached_wb}, unavailable={len(errors)}',flush=True)
     stamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     with (out/'latest.csv').open('w',newline='',encoding='utf-8-sig') as f:
         w=csv.writer(f);w.writerow(['series_id','name','category','unit','observation_date','value','frequency','source_url','download_utc'])
@@ -131,9 +192,9 @@ function riskOverview(items){let wb=items.filter(s=>s.provider==='World Bank'),l
  $('riskSummary').innerHTML=`<div class="risk-pill">World Bank economies<strong>${economies}</strong></div><div class="risk-pill">World Bank metrics<strong>${wb.length}</strong></div><div class="risk-pill">Rule-based risk warnings<strong>${warnings.length}</strong></div><div class="risk-pill">Interpretation<strong>Not a crisis probability</strong></div>`;
 }
 function nav(){ $('nav').innerHTML=groups.map(g=>`<button class="${g===group?'active':''}" data-group="${g}">${g}</button>`).join('');document.querySelectorAll('[data-group]').forEach(b=>b.onclick=()=>{group=b.dataset.group;render()}) }
-function render(){nav();setupCountries();let items=S.filter(s=>(group==='All'||s.category===group)&&(country==='All'||s.country===country)),extreme=items.filter(s=>risk(s)[1]==='high');riskOverview(items);$('summary').innerHTML=`<div class="pill"><b>${S.length}</b> metrics</div><div class="pill">Updated: <b>${D.updated}</b></div><div class="pill">Unavailable series: <b>${D.errors.length}</b></div><div class="pill">Statistical extremes (selected): <b>${extreme.length}</b></div>`;
+function render(){nav();setupCountries();let items=S.filter(s=>(group==='All'||s.category===group)&&(country==='All'||s.country===country)),extreme=items.filter(s=>risk(s)[1]==='high');riskOverview(items);$('summary').innerHTML=`<div class="pill"><b>${S.length}</b> metrics</div><div class="pill">Updated: <b>${D.updated}</b></div><div class="pill">Unavailable series: <b>${D.errors.length}</b></div><div class="pill">Cached series: <b>${S.filter(s=>s.data_status==='cached').length}</b></div><div class="pill">Statistical extremes (selected): <b>${extreme.length}</b></div>`;
 $('alerts').innerHTML=(D.errors.length?`<div class="alert bad">Unavailable series: ${D.errors.map(x=>x.replaceAll('<','&lt;')).join('; ')}</div>`:'')+(extreme.length?`<div class="alert">Historical extremes in selected section: ${extreme.map(s=>s.name).join(', ')}. <b>This is not a crisis forecast.</b></div>`:'');
-$('cards').innerHTML=items.map(s=>{let [label,cls]=risk(s),age=dateAge(s);return `<article class="card" data-id="${s.id}"><div class="meta">${s.country||'World'} · ${s.category} · ${s.frequency}</div><h3>${s.name}</h3><div class="value">${fmt(s.value)} <span class="unit">${s.unit}</span></div><div class="meta">Observation: ${s.date} · age ${age} days</div><div style="margin-top:10px"><span class="flag ${cls}">${label}</span>${warning(s)?` <span class="flag high">Risk warning: ${warning(s)}</span>`:''}</div><p class="explain">${s.description||""}</p>${spark(s)}</article>`}).join('');document.querySelectorAll('[data-id]').forEach(c=>c.onclick=()=>{selected=S.find(s=>s.id===c.dataset.id);chart();$('plot').scrollIntoView({behavior:'smooth',block:'center'})});if(!items.includes(selected))selected=items[0];chart()}
+$('cards').innerHTML=items.map(s=>{let [label,cls]=risk(s),age=dateAge(s);return `<article class="card" data-id="${s.id}"><div class="meta">${s.country||'World'} · ${s.category} · ${s.frequency}</div><h3>${s.name}</h3><div class="value">${fmt(s.value)} <span class="unit">${s.unit}</span></div><div class="meta">Observation: ${s.date} · age ${age} days${s.data_status==='cached' ? ' · Cached data (source temporarily unavailable)' : ''}</div><div style="margin-top:10px"><span class="flag ${cls}">${label}</span>${warning(s)?` <span class="flag high">Risk warning: ${warning(s)}</span>`:''}</div><p class="explain">${s.description||""}</p>${spark(s)}</article>`}).join('');document.querySelectorAll('[data-id]').forEach(c=>c.onclick=()=>{selected=S.find(s=>s.id===c.dataset.id);chart();$('plot').scrollIntoView({behavior:'smooth',block:'center'})});if(!items.includes(selected))selected=items[0];chart()}
 function chart(){if(!selected){$('chartTitle').textContent='No metrics for this selection';$('chartMeta').textContent='Choose another economy or analytical area';$('stats').textContent='';$('chartDescription').textContent='';$('plot').getContext('2d').clearRect(0,0,$('plot').width,$('plot').height);return}let s=selected;$('chartTitle').textContent=s.name;$('chartMeta').textContent=`${s.country||'World'} · ${s.provider||'FRED'} · ${s.id} · ${s.category} · ${s.unit} · latest observation ${s.date}`;$('source').href=s.source;$('chartDescription').textContent=s.description||'';
 $('periods').innerHTML=[1,3,5,10,20,50,0].map(y=>`<button class="${years===y?'active':''}" data-years="${y}">${y?y+'Y':'ALL'}</button>`).join('');document.querySelectorAll('[data-years]').forEach(b=>b.onclick=()=>{years=+b.dataset.years;chart()});
 let end=new Date(s.points[s.points.length-1][0]+'T00:00:00Z'),cut=new Date(end);if(years)cut.setUTCFullYear(cut.getUTCFullYear()-years);else cut=new Date('1900-01-01T00:00:00Z');let p=s.points.filter(x=>new Date(x[0]+'T00:00:00Z')>=cut);if(p.length<2)p=s.points.slice(-2);let first=p[0][1],last=p[p.length-1][1];$('stats').textContent=`Period: ${p[0][0]} – ${p[p.length-1][0]} · change ${fmt(last-first)} ${s.unit} (${first!==0?fmt((last/first-1)*100):'—'} %) · ${p.length} observations`;
